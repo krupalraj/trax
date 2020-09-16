@@ -23,7 +23,6 @@ import pickle
 import time
 
 import gin
-import jax
 import numpy as np
 import tensorflow as tf
 
@@ -40,7 +39,6 @@ from trax.rl import advantages
 from trax.rl import distributions
 from trax.rl import normalization  # So gin files see it. # pylint: disable=unused-import
 from trax.rl import policy_tasks
-from trax.rl import rl_layers
 from trax.rl import task as rl_task
 from trax.supervised import lr_schedules as lr
 
@@ -604,13 +602,15 @@ class ValueAgent(Agent):
                exploration_rate=functools.partial(
                    lr.multifactor,
                    factors='constant * decay_every',
-                   constant=0.1,  # pylint: disable=redefined-outer-name
+                   constant=1.,  # pylint: disable=redefined-outer-name
                    decay_factor=0.99,
-                   steps_per_decay=1),
+                   steps_per_decay=1,
+                   minimum=0.1),
                n_eval_episodes=0,
                only_eval=False,
                n_replay_epochs=1,
                max_slice_length=1,
+               sync_freq=1000,
                scale_value_targets=True,
                output_dir=None,
                **kwargs):
@@ -642,6 +642,9 @@ class ValueAgent(Agent):
           (batch, max_slice_length, number of actions)
           Higher max_slice_length implies that the network has to predict more
           values into the future.
+      sync_freq: frequency when to synchronize the target
+        network with the trained network. This is necessary for training the
+        network on bootstrapped targets, e.g. using n-step returns.
       scale_value_targets: If `True`, scale value function targets by
           `1 / (1 - gamma)`. We are trying to fix the problem with very large
           returns in some games in a way which does not introduce an additional
@@ -665,6 +668,7 @@ class ValueAgent(Agent):
     self._n_replay_epochs = n_replay_epochs
 
     self._exploration_rate = exploration_rate()
+    self._sync_at = (lambda step: step % sync_freq == 0)
 
     if scale_value_targets:
       self._value_network_scale = 1 / (1 - self._task.gamma)
@@ -692,10 +696,12 @@ class ValueAgent(Agent):
         model=value_model,
         optimizer=value_optimizer,
         lr_schedule=value_lr_schedule(),
-        loss_fn=tl.L2Loss(),
+        loss_fn=self.value_loss,
         inputs=self._inputs,
         output_dir=output_dir,
-        metrics={'value_loss': tl.L2Loss()}
+        metrics={'value_loss': self.value_loss,
+                 'value_mean': self.value_mean,
+                 'returns_mean': self.returns_mean}
     )
     value_batch = next(self.value_batches_stream())
     self._eval_model = tl.Accelerate(
@@ -720,29 +726,7 @@ class ValueAgent(Agent):
 
   def policy(self, trajectory, temperature=1):
     """Chooses an action to play after a trajectory."""
-    tr_slice = trajectory[-self._max_slice_length:]
-    trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
-    # Add batch dimension to trajectory_np and run the model.
-    obs = trajectory_np.observations[None, ...]
-    values = self._run_value_model(obs)
-    # We insisit that values and observations have the shape
-    # (batch, length, ...), where the length is the number of subsequent
-    # observations on a given trajectory
-    assert values.shape[:1] == obs.shape[:1]
-    # We select the last element in the batch and the value
-    # related to the last (current) observation
-    values = values[0, -1, :]
-    # temperature == 0 is used in another place in order to trigger eval
-    if np.random.random_sample() < self._exploration_rate(self._epoch) and \
-        temperature == 1:
-      sample = np.array(self.task.action_space.sample())
-    else:
-      # this is our way of doing the argmax
-      sample = jnp.argmax(values)
-    result = (sample, values)
-    if fastmath.backend_name() == 'jax':
-      result = fastmath.nested_map(lambda x: x.copy(), result)
-    return result
+    return NotImplementedError
 
   def train_epoch(self):
     """Trains RL for one epoch."""
@@ -760,56 +744,103 @@ class ValueAgent(Agent):
       self._value_trainer.train_epoch(
           self._value_train_steps_per_epoch // self._value_evals_per_epoch,
           self._value_eval_steps)
-
+      value_metrics = dict(
+          {'exploration_rate': self._exploration_rate(self._epoch)})
+      self._value_trainer.log_metrics(value_metrics,
+                                      self._value_trainer._train_sw, 'dqn')  # pylint: disable=protected-access
     # Update the target value network.
-    self._value_eval_model.weights = self._value_trainer.model_weights
-    self._value_eval_model.state = self._value_trainer.model_state
+    # TODO(henrykm) a bit tricky if sync_at does not coincide with epochs
+    if self._sync_at(self._value_trainer.step):
+      self._value_eval_model.weights = self._value_trainer.model_weights
+      self._value_eval_model.state = self._value_trainer.model_state
 
   def close(self):
     self._value_trainer.close()
     super().close()
 
-  def _run_value_model(self, obs):
-    """Runs value model."""
-    n_devices = fastmath.device_count()
-    weights = tl.for_n_devices(self._value_eval_model.weights, n_devices)
-    state = tl.for_n_devices(self._value_eval_model.state, n_devices)
-    rng = self._value_eval_model.rng
-    # TODO(henrykm): the line below fails on TPU with the error
-    # ValueError: Number of devices (8) does not evenly divide batch size (1).
-    obs_batch = obs.shape[0]
-    if n_devices > obs_batch:
-      obs = jnp.repeat(obs, int(n_devices / obs_batch), axis=0)
-    values, _ = self._value_eval_jit(obs, weights, state, rng)
-    values = values[:obs_batch]
-    values *= self._value_network_scale
-    return values
+  @property
+  def value_mean(self):
+    """The mean value of actions selected by the behavioral policy."""
+    return NotImplementedError
+
+  @property
+  def returns_mean(self):
+    """The mean value of actions selected by the behavioral policy."""
+    def f(values, index_max, returns, mask):
+      del values, index_max
+      return jnp.sum(returns) / jnp.sum(mask)
+    return tl.Fn('ReturnsMean', f)
 
 
 class DQN(ValueAgent):
-  """Trains a value model using DQN on the given RLTask."""
+  r"""Trains a value model using DQN on the given RLTask.
 
-  def __init__(
-      self,
-      task,
-      advantage_estimator=advantages.monte_carlo,
-      max_slice_length=1,
-      **kwargs
-  ):
+  Notice that the algorithm and the parameters signficantly diverge from
+  the original DQN paper. In particular we have separated learning and data
+  collection.
+
+  The Bellman loss is computed in the value_loss method. The formula takes
+  the state-action values tensors Q and n-step returns R:
+
+    .. math::
+        L(s,a) = Q(s,a) - R(s,a)
+
+  where R is computed in value_batches_stream. In the simplest case of the
+  1-step returns we are getting
+
+    .. math::
+        L(s,a) = Q(s,a) - r(s,a) - gamma * \max_{a'} Q'(s',a')
+
+  where s' is the state reached after taking action a in state s, Q' is
+  the target network, gamma is the discount factor and the maximum is taken
+  with respect to all actions avaliable in the state s'. The tensor Q' is
+  updated using the sync_freq parameter.
+
+  In code the maximum is visible in the policy method where we take
+  sample = jnp.argmax(values). The epsilon-greedy policy is taking a random
+  move with probability epsilon and oterhwise in state s it takes the
+  action argmax_a Q(s,a).
+  """
+
+  def __init__(self,
+               task,
+               advantage_estimator=advantages.monte_carlo,
+               max_slice_length=1,
+               smoothl1loss=True,
+               **kwargs):
 
     self._max_slice_length = max_slice_length
+    self._margin = max_slice_length-1
+    # Our default choice of learning targets for DQN are n-step targets
+    # implemented in the method td_k. We set the slice used for computation
+    # of td_k to max_slice_length and we set the "margin" in td_k
+    # to self._max_slice_length-1; in turn it implies that the shape of the
+    # returned tensor of n-step targets is
+    # values[:, :-(self.margin)] =  values[:, :1]
     self._advantage_estimator = advantage_estimator(
-        task.gamma, self._max_slice_length-1)
+        gamma=task.gamma, margin=self._margin)
+    self._smoothl1loss = smoothl1loss
     super(DQN, self).__init__(task=task,
                               max_slice_length=max_slice_length,
                               **kwargs)
 
   @property
   def value_loss(self):
-    """Value loss - so far generic for all A2C."""
-    def f(dist_inputs, values, returns):
-      del dist_inputs
-      return rl_layers.ValueLoss(values, returns, 1)
+    """Value loss computed using smooth L1 loss or L2 loss."""
+    def f(values, actions, returns, mask):
+      ind_0, ind_1 = np.indices(actions.shape)
+      # We calculate length using the shape of returns
+      # and adequatly remove a superflous slice of values.
+      # An analogous operation is done in value_batches_stream.
+      length = returns.shape[1]
+      values = values[:, :length, :]
+      selected_values = values[ind_0, ind_1, actions]
+      shapes.assert_same_shape(selected_values, returns)
+      shapes.assert_same_shape(selected_values, mask)
+      if self._smoothl1loss:
+        return tl.SmoothL1Loss().forward((selected_values, returns, mask))
+      else:
+        return tl.L2Loss().forward((selected_values, returns, mask))
     return tl.Fn('ValueLoss', f)
 
   @property
@@ -832,25 +863,33 @@ class DQN(ValueAgent):
       )
       values_max = np.array(jnp.max(values, axis=-1))
 
-      adv = self._advantage_estimator(
-          rewards=np_trajectory.rewards,
-          returns=np_trajectory.returns,
-          values=values_max,
-          dones=np_trajectory.dones,
-      )
+      # The advantage_estimator returns
+      #     gamma^n_steps * values_max(s_{i + n_steps}) + discounted_rewards
+      #        - values_max(s_i)
+      # hence we have to add values_max(s_i) in order to get n-step returns:
+      #     gamma^n_steps * values_max(s_{i + n_steps}) + discounted_rewards
+      # Notice, that in DQN the tensor values_max[:, :-self._margin]
+      # is the same as values_max[:, :-1].
+      n_step_returns = values_max[:, :-self._margin] + \
+          self._advantage_estimator(
+              rewards=np_trajectory.rewards,
+              returns=np_trajectory.returns,
+              values=values_max,
+              dones=np_trajectory.dones
+              )
 
-      length = adv.shape[1]
+      length = n_step_returns.shape[1]
       values = values[:, :length, :]
-      indices_max = (np.arange(values.shape[0]), np.arange(values.shape[1]),
-                     np.argmax(values, axis=-1))
-      # TODO(henrykm): change it to fastmath instead of jax.ops
-      target_returns = jax.ops.index_add(values, indices_max, adv)
+      # index_max = np.argmax(values, axis=-1)
+      target_returns = n_step_returns[:, :length]
       inputs = np_trajectory.observations[:, :length, :]
 
       yield (
           # Inputs are observations
           # (batch, length, obs)
           inputs,
+          # the max indices will be needed to compute the loss
+          np_trajectory.actions[:, :length],  # index_max,
           # Targets: computed returns.
           # target_returns, we expect here shapes such as
           # (batch, length, num_actions)
@@ -858,5 +897,68 @@ class DQN(ValueAgent):
           # TODO(henrykm): mask has the shape (batch, max_slice_length)
           # that is it misses the action dimension; the preferred format
           # would be np_trajectory.mask[:, :length, :] but for now we pass:
-          np.ones(shape=target_returns.shape)
+          np.ones(shape=target_returns.shape),
       )
+
+  def policy(self, trajectory, temperature=1):
+    """Chooses an action to play after a trajectory."""
+    tr_slice = trajectory[-self._max_slice_length:]
+    trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
+    # Add batch dimension to trajectory_np and run the model.
+    obs = trajectory_np.observations[None, ...]
+    values = self._run_value_model(obs, use_eval_model=False)
+    # We insisit that values and observations have the shape
+    # (batch, length, ...), where the length is the number of subsequent
+    # observations on a given trajectory
+    assert values.shape[:1] == obs.shape[:1]
+    # We select the last element in the batch and the value
+    # related to the last (current) observation
+    values = values[0, -1, :]
+    # temperature == 0 is used in another place in order to trigger eval
+    if np.random.random_sample() < self._exploration_rate(self._epoch) and \
+        temperature == 1:
+      sample = np.array(self.task.action_space.sample())
+    else:
+      # this is our way of doing the argmax
+      sample = jnp.argmax(values)
+    result = (sample, values)
+    if fastmath.backend_name() == 'jax':
+      result = fastmath.nested_map(lambda x: x.copy(), result)
+    return result
+
+  def _run_value_model(self, obs, use_eval_model=True):
+    """Runs value model."""
+    n_devices = fastmath.device_count()
+    if use_eval_model:
+      weights = tl.for_n_devices(self._value_eval_model.weights, n_devices)
+      state = tl.for_n_devices(self._value_eval_model.state, n_devices)
+      rng = self._value_eval_model.rng
+    else:
+      weights = tl.for_n_devices(self._value_trainer.model_weights, n_devices)
+      state = tl.for_n_devices(self._value_trainer.model_state, n_devices)
+      rng = self._value_eval_model.rng
+    # TODO(henrykm): the line below fails on TPU with the error
+    # ValueError: Number of devices (8) does not evenly divide batch size (1).
+    obs_batch = obs.shape[0]
+    if n_devices > obs_batch:
+      obs = jnp.repeat(obs, int(n_devices / obs_batch), axis=0)
+    values, _ = self._value_eval_jit(obs, weights, state, rng)
+    values = values[:obs_batch]
+    values *= self._value_network_scale
+    return values
+
+  @property
+  def value_mean(self):
+    """The mean value of actions selected by the behavioral policy."""
+    def f(values, actions, returns, mask):
+      ind_0, ind_1 = np.indices(actions.shape)
+      # We calculate length using the shape of returns
+      # and adequatly remove a superflous slice of values.
+      # An analogous operation is done in value_batches_stream.
+      length = returns.shape[1]
+      values = values[:, :length, :]
+      selected_values = values[ind_0, ind_1, actions]
+      shapes.assert_same_shape(selected_values, returns)
+      shapes.assert_same_shape(selected_values, mask)
+      return jnp.sum(selected_values) / jnp.sum(mask)
+    return tl.Fn('ValueMean', f)
