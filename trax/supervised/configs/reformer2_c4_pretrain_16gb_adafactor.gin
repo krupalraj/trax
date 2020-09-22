@@ -68,7 +68,7 @@ batcher.bucket_length = 512
 # per batch on a 2x2 TPU on average per step. T5's batch is ~65k tokens/batch.
 # i.e. 18x bigger than ours.
 batcher.batch_size_per_device = 24
-batcher.eval_batch_size = 64
+batcher.eval_batch_size = 16
 batcher.max_eval_length = %max_length
 batcher.buckets_include_inputs_in_length=True
 batcher.id_to_mask = 0
@@ -112,10 +112,10 @@ train.optimizer = @trax.optimizers.Adafactor
 train.checkpoint_highest = 'accuracy'
 train.checkpoint_lowest = 'loss'
 
-# attn_type = @LSHSelfAttention
-# enc_attn_type = @ref2_encoder/LSHSelfAttention
-attn_type = @SelfAttention
+# enc_attn_type = @LSHSelfAttention
+# dec_attn_type = @ref2_encoder/LSHSelfAttention
 enc_attn_type = @SelfAttention
+dec_attn_type = @CausalAttention
 
 
 # Parameters for Reformer2:
@@ -135,8 +135,8 @@ Reformer2.n_decoder_layers = %n_layers
 Reformer2.input_vocab_size = %vocab_size
 Reformer2.d_attention_key = %attn_kv    # d_model // n_heads
 Reformer2.d_attention_value = %attn_kv  # d_model // n_heads
-Reformer2.encoder_attention_type = %attn_type
-Reformer2.encoder_decoder_attention_type = %enc_attn_type
+Reformer2.encoder_attention_type = %enc_attn_type
+Reformer2.encoder_decoder_attention_type = %dec_attn_type
 Reformer2.d_axial_pos_embs = %d_axial_pos_embs
 Reformer2.n_layers_forget = 12
 
